@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/http-echo/version"
@@ -17,10 +20,15 @@ var (
 	listenFlag  = flag.String("listen", ":5678", "address and port to listen")
 	textFlag    = flag.String("text", "", "text to put on the webpage")
 	versionFlag = flag.Bool("version", false, "display version information")
+	counterFlag = flag.Bool("counter", false, "count handled request by second bucket")
 
 	// stdoutW and stderrW are for overriding in test.
 	stdoutW = os.Stdout
 	stderrW = os.Stderr
+
+	requestCount  = make(map[string]int64)
+	incomingReqCh = make(chan string, 10000)
+	m = sync.Mutex{}
 )
 
 func main() {
@@ -50,6 +58,11 @@ func main() {
 
 	// Health endpoint
 	mux.HandleFunc("/health", withAppHeaders(httpHealth()))
+	
+	// Get metrics endpoint
+	if *counterFlag {
+		mux.HandleFunc("/metric", withAppHeaders(httpGetMetrics()))
+	}
 
 	server := &http.Server{
 		Addr:    *listenFlag,
@@ -66,6 +79,10 @@ func main() {
 
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, os.Interrupt)
+	
+	if *counterFlag {
+		go handleRequestCount(serverCh)
+	}
 
 	// Wait for interrupt
 	<-signalCh
@@ -85,11 +102,50 @@ func main() {
 func httpEcho(v string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, v)
+		
+		// add request counter
+		if *counterFlag {
+			go func() {
+				incomingReqCh <- fmt.Sprint(time.Now().Unix())
+			}()
+		}
 	}
 }
 
 func httpHealth() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `{"status":"ok"}`)
+	}
+}
+
+func handleRequestCount(stopCh chan struct{}) {
+	for {
+		select {
+		case <-stopCh:
+			return
+		case k := <-incomingReqCh:
+			m.Lock()
+			if n, ok := requestCount[k]; !ok {
+				requestCount[k] = 1
+			} else {
+				requestCount[k] = n + 1
+			}
+			m.Unlock()
+		}
+	}
+}
+
+func httpGetMetrics() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.ToUpper(r.Method) == "DELETE" {
+			m.Lock()
+			requestCount = make(map[string]int64, 10000)
+			m.Unlock()
+			w.Write([]byte("map reset"))
+			return
+		}
+		w.Header().Set("content-type", "application/json")
+		payload, _ := json.Marshal(requestCount)
+		w.Write(payload)
 	}
 }
